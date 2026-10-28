@@ -8,6 +8,7 @@
 #include "core/main_funcs.h"
 #include "decode/icao_country.h"
 #include "decode/band_plan.h"
+#include "decode/acars_explain.h"
 #include "i18n/i18n.h"
 #include "util/log.h"
 #include "version.h"
@@ -21,6 +22,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cctype>
+#include <ctime>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -62,6 +65,71 @@ static bool drawPpmAdjust(const char* label, float* ppm)
 #endif
 
 void drawSdrplayControls(App& app);
+
+// Bring an aircraft up on the Flight Map (airplanes.live) and switch to that
+// tab. A manual pick turns off "Follow aircraft on voice call", which would
+// otherwise jump straight back to the voice-call aircraft.
+static void showAircraftOnMap(App& app, uint32_t aes, const std::string& icaoText)
+{
+#if defined(_WIN32)
+    std::string hex;
+    if (aes) { char b[8]; std::snprintf(b, sizeof(b), "%06X", aes & 0xFFFFFF); hex = b; }
+    else if (icaoText.size() == 6 && std::all_of(icaoText.begin(), icaoText.end(), [](char c) { return std::isxdigit((unsigned char)c); })) hex = icaoText;
+    if (hex.empty()) return;
+    FlightMapWebView& map = app.flightMapWv;
+    if (map.mode == 2) { map.mode = 1; map.applyMode(); }
+    map.followVoice = false;
+    map.showAircraft(hex);
+    ImGui::SetWindowFocus("###Flight Map");
+#else
+    (void)app; (void)aes; (void)icaoText;
+#endif
+}
+
+// Waveform of a call: mirrored peak envelope, one bar per pixel, scaled to the
+// call's loudest moment, with a playback cursor. Hover shows the time.
+// Returns the clicked position in seconds, or -1 if not clicked.
+static float drawCallWaveform(App& app, const std::vector<int16_t>& pcm, bool playing, float posSec)
+{
+    const float wh = ImGui::GetFrameHeight() * 3.2f;
+    const float ww = std::max(1.0f, ImGui::GetContentRegionAvail().x);
+    const ImVec2 p0 = ImGui::GetCursorScreenPos();
+    const bool clicked = ImGui::InvisibleButton("##callwave", ImVec2(ww, wh));
+    float clickSec = -1.0f;
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImVec2 p1(p0.x + ww, p0.y + wh);
+    const bool light = app.lightMode;
+    dl->AddRectFilled(p0, p1, light ? IM_COL32(235, 238, 244, 255) : IM_COL32(16, 20, 28, 255), 3.0f);
+    const float mid = p0.y + wh * 0.5f;
+    dl->AddLine(ImVec2(p0.x, mid), ImVec2(p1.x, mid), light ? IM_COL32(180, 186, 200, 255) : IM_COL32(60, 70, 90, 255));
+    const int n = (int)pcm.size();
+    if (n == 0) return -1.0f;
+    if (clicked)
+        clickSec = std::clamp((ImGui::GetIO().MousePos.x - p0.x) / ww, 0.0f, 1.0f) * n / 8000.0f;
+    int peak = 1;
+    for (int16_t v : pcm) peak = std::max(peak, std::abs((int)v));
+    const float scale = (wh * 0.48f) / (float)std::max(peak, 1500);
+    const int cols = std::max(1, (int)ww);
+    const ImU32 col = light ? IM_COL32(30, 110, 200, 255) : IM_COL32(90, 200, 255, 230);
+    for (int c = 0; c < cols; c++) {
+        const int i0 = (int)((long long)c * n / cols), i1 = (int)((long long)(c + 1) * n / cols);
+        int pk = 0;
+        for (int k = i0; k < i1 && k < n; k++) pk = std::max(pk, std::abs((int)pcm[k]));
+        if (pk < 2) continue;
+        const float h = std::max(1.0f, pk * scale);
+        dl->AddLine(ImVec2(p0.x + c + 0.5f, mid - h), ImVec2(p0.x + c + 0.5f, mid + h), col);
+    }
+    if (playing) {
+        const float x = p0.x + std::min(1.0f, posSec * 8000.0f / n) * ww;
+        dl->AddLine(ImVec2(x, p0.y), ImVec2(x, p1.y), IM_COL32(255, 120, 80, 255), 2.0f);
+    }
+    if (ImGui::IsItemHovered()) {
+        const float fx = (ImGui::GetIO().MousePos.x - p0.x) / std::max(1.0f, ww);
+        ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+        ImGui::SetTooltip("%.1f s  (click to play from here)", std::clamp(fx, 0.0f, 1.0f) * n / 8000.0f);
+    }
+    return clickSec;
+}
 
 void reloadBandPlans(App& app) {
     scanBandPlans(app.bandPlanDir, app.bandPlanNames, app.bandPlanPaths, &app.bandPlanErrors);
@@ -1710,6 +1778,23 @@ void drawMessages(App& app)
     copyAllButton(msgCopy);
     ImGui::SameLine();
     ImGui::Checkbox(_L("Show empty"), &app.showEmptyMsgs);
+    // Pause: freeze the list so it can be read (messages keep being logged).
+    static bool msgPaused = false;
+    static std::vector<DecodedMessage> frozenMsgs;
+    static unsigned long long frozenTotal = 0;
+    ImGui::SameLine();
+    if (ImGui::Button(msgPaused ? "Resume" : "Pause")) {
+        msgPaused = !msgPaused;
+        if (msgPaused) {
+            frozenMsgs = app.decoders.log().snapshot();
+            if (app.dualMode) { auto b = app.decodersB.log().snapshot(); frozenMsgs.insert(frozenMsgs.end(), b.begin(), b.end()); }
+            frozenTotal = msgTotal;
+        }
+    }
+    if (msgPaused) {
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.3f, 1.0f), "Paused (%llu new)", msgTotal - frozenTotal);
+    }
     ImGui::SameLine();
     ImGui::SetNextItemWidth(-1.0f);
     ImGui::InputTextWithHint("##searchmsg", "Search...", app.searchBuf, sizeof(app.searchBuf));
@@ -1758,12 +1843,19 @@ void drawMessages(App& app)
     }
     ImGui::Separator();
 
-    auto msgs = app.decoders.log().snapshot();
-    if (app.dualMode)
-    {
-        auto b = app.decodersB.log().snapshot();
-        msgs.insert(msgs.end(), b.begin(), b.end());
+    std::vector<DecodedMessage> msgs;
+    if (msgPaused) msgs = frozenMsgs;
+    else {
+        msgs = app.decoders.log().snapshot();
+        if (app.dualMode)
+        {
+            auto b = app.decodersB.log().snapshot();
+            msgs.insert(msgs.end(), b.begin(), b.end());
+        }
     }
+    // Selected message (a copy, so it stays put while the list moves).
+    static bool msgHasSel = false;
+    static DecodedMessage msgSel;
     // Filter on search text (case-insensitive substring across all fields).
     std::string searchLower;
     bool hasSearch = (app.searchBuf[0] != 0);
@@ -1772,9 +1864,11 @@ void drawMessages(App& app)
         searchLower = app.searchBuf;
         for (auto& ch : searchLower) ch = (char)std::tolower((unsigned char)ch);
     }
+    const float detailH = msgHasSel ? std::max(150.0f, ImGui::GetContentRegionAvail().y * 0.38f) : 0.0f;
     if (ImGui::BeginTable("##msgs", 7,
                           ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
-                          ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable))
+                          ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable,
+                          ImVec2(0, msgHasSel ? -detailH : 0.0f)))
     {
         ImGui::TableSetupColumn("UTC", ImGuiTableColumnFlags_WidthFixed, 54);
         ImGui::TableSetupColumn("Freq", ImGuiTableColumnFlags_WidthFixed, 64);
@@ -1814,7 +1908,15 @@ void drawMessages(App& app)
 #else
                 gmtime_r(&t, &tm);
 #endif
-                ImGui::TextDisabled("%02d:%02d:%02d", tm.tm_hour, tm.tm_min, tm.tm_sec);
+                char tl[16];
+                std::snprintf(tl, sizeof(tl), "%02d:%02d:%02d", tm.tm_hour, tm.tm_min, tm.tm_sec);
+                const bool isSel = msgHasSel && msgSel.timeSec == it->timeSec && msgSel.aesId == it->aesId &&
+                                   msgSel.text == it->text;
+                // Click a row (its time) to see it explained below.
+                if (ImGui::Selectable(tl, isSel, ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowOverlap)) {
+                    if (isSel) msgHasSel = false;
+                    else { msgSel = *it; msgHasSel = true; }
+                }
             }
             ImGui::TableNextColumn();
             ImGui::Text("%.3f", it->freqMHz);
@@ -1823,9 +1925,25 @@ void drawMessages(App& app)
             ImGui::TableNextColumn();
             ImGui::TextUnformatted(it->reg.c_str());
             ImGui::TableNextColumn();
-            ImGui::Text("%06X", it->aesId);
+            if (it->aesId) {
+                char ab[8];
+                std::snprintf(ab, sizeof(ab), "%06X", it->aesId & 0xFFFFFF);
+                ImGui::PushStyleColor(ImGuiCol_Text, Lc(app, ImVec4(1.0f, 0.85f, 0.3f, 1.0f)));
+                if (ImGui::SmallButton(ab)) showAircraftOnMap(app, it->aesId, it->icao);
+                ImGui::PopStyleColor();
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Show this aircraft on the Flight Map");
+            } else
+                ImGui::TextDisabled("--");
             ImGui::TableNextColumn();
-            ImGui::TextUnformatted(it->label.c_str());
+            {
+                std::string lab = it->label;
+                for (auto& ch : lab) if ((unsigned char)ch < 0x20 || (unsigned char)ch >= 0x7f) ch = '.';
+                ImGui::TextUnformatted(lab.c_str());
+                if (ImGui::IsItemHovered()) {
+                    const std::string mean = acarsLabelMeaning(it->label);
+                    if (!mean.empty()) ImGui::SetTooltip("%s", mean.c_str());
+                }
+            }
             ImGui::TableNextColumn();
             ImGui::TextWrapped("%s", it->text.c_str());
             if (it->hasPos)
@@ -1863,6 +1981,26 @@ void drawMessages(App& app)
         handleTableCopy(copyRows);
         msgCopy = copyJoin(copyRows);
         ImGui::EndTable();
+    }
+    // Plain-English breakdown of the selected message.
+    if (msgHasSel) {
+        ImGui::BeginChild("##msgdetail", ImVec2(0, 0), ImGuiChildFlags_Borders);
+        ImGui::TextColored(Lc(app, ImVec4(0.5f, 0.85f, 1.0f, 1.0f)), "In plain English");
+        ImGui::SameLine();
+        if (msgSel.aesId) {
+            if (ImGui::SmallButton("Show on map")) showAircraftOnMap(app, msgSel.aesId, msgSel.icao);
+            ImGui::SameLine();
+        }
+        static std::string explainCopy;
+        explainCopy = explainAcars(msgSel) + "\nRaw text: " + msgSel.text;
+        if (ImGui::SmallButton("Copy")) ImGui::SetClipboardText(explainCopy.c_str());
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Close")) msgHasSel = false;
+        ImGui::Separator();
+        ImGui::TextWrapped("%s", explainAcars(msgSel).c_str());
+        ImGui::TextDisabled("Raw text:");
+        ImGui::TextWrapped("%s", msgSel.text.c_str());
+        ImGui::EndChild();
     }
 
     ImGui::End();
@@ -2128,10 +2266,94 @@ void drawFlightMap(App& app)
         auto second = app.decodersB.aircraftTable().snapshot();
         acs.insert(acs.end(), second.begin(), second.end());
     }
-    app.flightMapWv.updateAircraft(acs);
-    ImGui::Checkbox("Online positions for received aircraft", &app.flightMapWv.onlinePositions);
-    ImGui::TextWrapped("%s", app.flightMapWv.positionStatus().c_str());
-    if (!app.flightMapWv.isReady()) ImGui::TextDisabled("Loading received-aircraft map...");
+    FlightMapWebView& map = app.flightMapWv;
+    {
+        const char* modes[] = { "All live traffic (airplanes.live)",
+                                "Received aircraft only (airplanes.live)",
+                                "Received aircraft only (decoded positions)" };
+        ImGui::SetNextItemWidth(300);
+        if (ImGui::Combo("Map", &map.mode, modes, 3)) map.applyMode();
+    }
+
+    if (map.mode == 0 || map.mode == 1)
+    {
+        // Aircraft whose voice call is being monitored (SDR B does voice in
+        // dual mode). On Inmarsat Aero the AES ID is the ICAO 24-bit address.
+        uint32_t voiceAes = app.dualMode ? app.decodersB.voiceAes() : 0;
+        if (!voiceAes) voiceAes = app.decoders.voiceAes();
+        auto icaoOf = [](uint32_t aes) { char b[8]; std::snprintf(b, sizeof(b), "%06X", aes & 0xFFFFFF); return std::string(b); };
+        auto describe = [&](const std::string& icao) {
+            std::string out = icao;
+            for (const auto& a : acs) {
+                if (icaoOf(a.aesId) != icao && a.icao != icao) continue;
+                if (!a.flight.empty()) out += "  " + a.flight;
+                if (!a.reg.empty())    out += "  " + a.reg;
+                break;
+            }
+            return out;
+        };
+
+        if (map.mode == 1) {
+            // Aircraft received in the last hour, newest first, capped so the
+            // filter stays a reasonable size.
+            std::vector<const AircraftEntry*> live;
+            const double nowSec = (double)std::time(nullptr);
+            for (const auto& a : acs) if (a.aesId && nowSec - a.lastSeen < 3600.0) live.push_back(&a);
+            std::sort(live.begin(), live.end(),
+                      [](const AircraftEntry* x, const AircraftEntry* y) { return x->lastSeen > y->lastSeen; });
+            std::vector<std::string> ids;
+            if (voiceAes) ids.push_back(icaoOf(voiceAes));
+            for (const auto* a : live) { if (ids.size() >= 200) break; ids.push_back(icaoOf(a->aesId)); }
+            map.setReceived(ids);
+        }
+
+        ImGui::SameLine();
+        ImGui::Checkbox("Follow aircraft on voice call", &map.followVoice);
+        if (map.followVoice && voiceAes) map.showAircraft(icaoOf(voiceAes));
+
+        // Manual pick from received aircraft, most recent first.
+        std::vector<const AircraftEntry*> recent;
+        for (const auto& a : acs) if (a.aesId) recent.push_back(&a);
+        std::sort(recent.begin(), recent.end(),
+                  [](const AircraftEntry* x, const AircraftEntry* y) { return x->lastSeen > y->lastSeen; });
+        static uint32_t chosenAes = 0;
+        std::string chosenLabel = chosenAes ? describe(icaoOf(chosenAes)) : std::string("Select received aircraft...");
+        ImGui::SetNextItemWidth(260);
+        if (ImGui::BeginCombo("##mapaircraft", chosenLabel.c_str()))
+        {
+            for (const auto* a : recent) {
+                const std::string label = describe(icaoOf(a->aesId));
+                ImGui::PushID((int)a->aesId);
+                if (ImGui::Selectable(label.c_str(), a->aesId == chosenAes)) chosenAes = a->aesId;
+                ImGui::PopID();
+            }
+            if (recent.empty()) ImGui::TextDisabled("No aircraft received yet");
+            ImGui::EndCombo();
+        }
+        ImGui::SameLine();
+        ImGui::BeginDisabled(chosenAes == 0);
+        if (ImGui::Button("Show on map")) map.showAircraft(icaoOf(chosenAes));
+        ImGui::EndDisabled();
+
+        const std::string shown = map.shownIcao();
+        ImGui::SameLine();
+        if (voiceAes && map.followVoice)
+            ImGui::TextColored(ImVec4(0.3f, 0.85f, 0.4f, 1.0f), "On voice call: %s", describe(icaoOf(voiceAes)).c_str());
+        else if (!shown.empty()) {
+            std::string up = shown;
+            for (auto& c : up) c = (char)std::toupper((unsigned char)c);
+            ImGui::TextDisabled("Showing: %s", describe(up).c_str());
+        }
+        else ImGui::TextDisabled("Waiting for a voice call...");
+        if (!map.isReady()) ImGui::TextDisabled("Loading airplanes.live...");
+    }
+    else
+    {
+        map.updateAircraft(acs);
+        ImGui::Checkbox("Online positions for received aircraft", &map.onlinePositions);
+        ImGui::TextWrapped("%s", map.positionStatus().c_str());
+        if (!map.isReady()) ImGui::TextDisabled("Loading received-aircraft map...");
+    }
     // Embed the map as an Edge WebView2 child window inside this panel.
     // Hide when another tab in the same dock is active.
     ImVec2 pos  = ImGui::GetCursorScreenPos();
@@ -2149,8 +2371,19 @@ void drawFlightMap(App& app)
         ImGui::SetCursorScreenPos(pos);
         ImGui::TextWrapped("%s", _L("Dock the Flight Map back in the main window to show the embedded map."));
     }
-    else
-        app.flightMapWv.setBounds((int)pos.x, (int)pos.y, w, h, tabActive);
+    else {
+        // With multi-viewports ImGui positions are desktop coordinates; the
+        // WebView is a child of the main window, so make them relative to its
+        // client area (otherwise the map sits a title bar's height too low).
+        const ImVec2 vp = ImGui::GetMainViewport()->Pos;
+        // The map is a native window drawn on top of everything ImGui draws,
+        // so it would cover any dropdown list or menu that opens over it
+        // (e.g. this panel's Map / aircraft lists). Step it aside (the same
+        // show/hide used when switching tabs - nothing is suspended) while one
+        // is open.
+        const bool popupOpen = ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel);
+        app.flightMapWv.setBounds((int)(pos.x - vp.x), (int)(pos.y - vp.y), w, h, tabActive && !popupOpen);
+    }
 
     ImGui::End();
 }
@@ -2618,11 +2851,41 @@ void drawVoiceCalls(App& app)
     }
     ImGui::SameLine();
 
-    // Playback status
+    // Playback status + Pause/Resume and Stop for the loaded call.
+    if (app.audioPlayer.isLoaded()) {
+        if (app.audioPlayer.isPaused()) {
+            if (ImGui::SmallButton("Resume##vcpr")) app.audioPlayer.resume();
+        } else if (ImGui::SmallButton("Pause##vcpr")) app.audioPlayer.pause();
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Stop##vcps")) app.audioPlayer.stop();
+        ImGui::SameLine();
+    }
     if (app.audioPlayer.isPlaying())
         ImGui::TextColored(ImVec4(0.3f, 1.0f, 0.4f, 1.0f), "  Playing... %.0fs", (double)app.audioPlayer.positionSec());
+    else if (app.audioPlayer.isPaused())
+        ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f), "  Paused at %.0fs", (double)app.audioPlayer.positionSec());
     else
         ImGui::TextDisabled("  Idle");
+
+    // Waveform of the selected (or playing) call.
+    static std::string wfFile;            // filename whose audio is loaded
+    static std::vector<int16_t> wfPcm;
+    static std::string selFile;           // selected row (by filename)
+    if (!selFile.empty() && selFile != wfFile) {
+        wfFile = selFile;
+        if (!AudioPlayer::loadPcm(std::string(app.recordDir) + "/" + selFile, wfPcm)) wfPcm.clear();
+    }
+    if (!selFile.empty()) {
+        const bool loadedSel = app.audioPlayer.isLoaded() &&
+                               app.audioPlayer.currentPath().find(selFile) != std::string::npos;
+        ImGui::TextDisabled("%s", selFile.c_str());
+        const float at = drawCallWaveform(app, wfPcm, loadedSel, app.audioPlayer.positionSec());
+        if (at >= 0.0f) {
+            // Click: jump there in the playing/paused call, or start it there.
+            if (!loadedSel) app.audioPlayer.play(std::string(app.recordDir) + "/" + selFile);
+            app.audioPlayer.seek(at);
+        }
+    }
 
     if (ImGui::BeginTable("##vclist", 5,
                           ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
@@ -2650,18 +2913,33 @@ void drawVoiceCalls(App& app)
 #else
             localtime_r(&t, &tm);
 #endif
-            ImGui::Text("%02d:%02d:%02d", tm.tm_hour, tm.tm_min, tm.tm_sec);
+            {
+                char tl[32];
+                std::snprintf(tl, sizeof(tl), "%02d:%02d:%02d##vcsel%d", tm.tm_hour, tm.tm_min, tm.tm_sec, rowIdx);
+                // Click the time to select the call and show its waveform.
+                if (ImGui::Selectable(tl, !c.filename.empty() && c.filename == selFile, 0,
+                                      ImGui::CalcTextSize("00:00:00")))
+                    selFile = c.filename;
+            }
 
             ImGui::TableNextColumn();
             ImGui::Text("%.4f", c.freqMHz);
 
             ImGui::TableNextColumn();
-            if (!c.icao.empty())
-                ImGui::TextColored(Lc(app, ImVec4(1.0f, 0.85f, 0.3f, 1.0f)), "%s", c.icao.c_str());
-            else if (c.aesId)
-                ImGui::TextDisabled("%06X", c.aesId);
-            else
-                ImGui::TextUnformatted("--");
+            {
+                // Click the ICAO address to see the aircraft on the Flight Map.
+                std::string ic = !c.icao.empty() ? c.icao : (c.aesId ? copyFmt("%06X", c.aesId) : std::string());
+                if (!ic.empty()) {
+                    ImGui::PushStyleColor(ImGuiCol_Text, Lc(app, ImVec4(1.0f, 0.85f, 0.3f, 1.0f)));
+                    ImGui::PushID(rowIdx);
+                    if (ImGui::Selectable(ic.c_str(), false, 0, ImGui::CalcTextSize(ic.c_str())))
+                        showAircraftOnMap(app, c.aesId, c.icao);
+                    ImGui::PopID();
+                    ImGui::PopStyleColor();
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Show this aircraft on the Flight Map");
+                } else
+                    ImGui::TextUnformatted("--");
+            }
 
             ImGui::TableNextColumn();
             // Duration
@@ -2682,18 +2960,24 @@ void drawVoiceCalls(App& app)
 
             ImGui::TableNextColumn();
             // Play button — use row index for unique ImGui ID across A/B merge.
-            bool sel = app.audioPlayer.isPlaying() && !c.filename.empty() &&
-                       app.audioPlayer.currentPath().find(c.filename) != std::string::npos;
+            // Playing -> "||" pauses; paused -> ">" resumes where it was;
+            // otherwise ">" plays from the start.
+            const bool loaded = app.audioPlayer.isLoaded() && !c.filename.empty() &&
+                                app.audioPlayer.currentPath().find(c.filename) != std::string::npos;
+            const bool sel = loaded && app.audioPlayer.isPlaying();
             char label[24];
             std::snprintf(label, sizeof(label), "%s##vcp%d", sel ? "||" : ">", rowIdx);
             if (ImGui::SmallButton(label))
             {
                 if (sel)
-                    app.audioPlayer.stop();
+                    app.audioPlayer.pause();
+                else if (loaded && app.audioPlayer.isPaused())
+                    app.audioPlayer.resume();
                 else if (!c.filename.empty())
                 {
                     std::string fullPath = std::string(app.recordDir) + "/" + c.filename;
                     app.audioPlayer.play(fullPath);
+                    selFile = c.filename;
                 }
             }
             copyRows.push_back(copyFmt("%02d:%02d:%02d\t%.4f\t%s\t%s",
