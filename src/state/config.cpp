@@ -70,6 +70,7 @@ void cfgWriteAll(App& app, ImGuiTextBuffer* buf)
     WS(recordDir);
     WI(recordFormat);
     WI(recordVoice);
+    WI(sttOn); WI(sttTranslate); WI(sttLargeAll); WS(sttVocab);
     WI(saveDecoders);
     WI(acPosOnly);
     WI(showEmptyMsgs);
@@ -149,6 +150,7 @@ void cfgReadLine(App& app, const char* line)
     RB(voiceFollow); RF(followHoldSec);
     RS(recordDir);
     RI(recordFormat); RB(saveDecoders); RB(recordVoice);
+    RB(sttOn); RB(sttTranslate); RB(sttLargeAll); RS(sttVocab);
     // savedDecoder lines: freqMHz,baud (e.g. "1545.020,600")
     if (!std::strcmp(key, "savedDecoder"))
     {

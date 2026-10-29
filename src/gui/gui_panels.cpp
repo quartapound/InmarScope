@@ -9,6 +9,12 @@
 #include "decode/icao_country.h"
 #include "decode/band_plan.h"
 #include "decode/acars_explain.h"
+#include "stt/transcriber.h"
+#include <filesystem>
+#include <fstream>
+#include <map>
+#include <mutex>
+#include <sstream>
 #include "i18n/i18n.h"
 #include "util/log.h"
 #include "version.h"
@@ -2813,6 +2819,190 @@ void drawConstellation(App& app)
 // Voice Calls browser
 // ---------------------------------------------------------------------------
 
+// ---- Speech-to-text of recorded calls (stt/transcriber.h) -------------------
+// Transcripts are kept by recording file name; each is also written next to
+// the recording as a .txt (and read back from there after a restart).
+namespace {
+struct TxEntry { int state = 0; std::string lang, text, en; }; // 0 none, 1 queued, 2 done, 3 no speech, 4 failed
+std::mutex g_txMtx;
+std::map<std::string, TxEntry> g_tx;
+std::map<int, std::string> g_txIdFile;
+int g_txNextId = 1;
+const double g_txAppStart = (double)std::time(nullptr);
+
+std::string txTxtPath(const std::string& dir, const std::string& file) {
+    std::string f = file;
+    const size_t dot = f.find_last_of('.');
+    if (dot != std::string::npos) f = f.substr(0, dot);
+    return dir + "/" + f + ".txt";
+}
+
+// "[lang, whisper model]\n<text>\n\n[English translation]\n<text>"
+bool txLoadTxt(const std::string& path, TxEntry& e) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return false;
+    std::stringstream ss; ss << in.rdbuf();
+    std::string all = ss.str(), head;
+    const size_t nl = all.find('\n');
+    if (nl == std::string::npos) return false;
+    head = all.substr(0, nl);
+    std::string body = all.substr(nl + 1);
+    if (head.size() > 2 && head[0] == '[') e.lang = head.substr(1, head.find_first_of(",]") - 1);
+    const std::string mark = "\n[English translation]\n";
+    const size_t m = body.find(mark);
+    if (m != std::string::npos) { e.en = body.substr(m + mark.size()); body = body.substr(0, m); }
+    while (!body.empty() && (body.back() == '\n' || body.back() == '\r')) body.pop_back();
+    while (!e.en.empty() && (e.en.back() == '\n' || e.en.back() == '\r')) e.en.pop_back();
+    e.text = body;
+    e.state = 2;
+    return true;
+}
+
+void txQueue(App& app, const std::string& file) {
+    const std::string path = std::string(app.recordDir) + "/" + file;
+    int id;
+    {
+        std::lock_guard<std::mutex> lk(g_txMtx);
+        id = g_txNextId++;
+        g_txIdFile[id] = file;
+        g_tx[file].state = 1;
+    }
+    stt::Transcriber::instance().submit_loader(
+        id, [path] { std::vector<int16_t> pcm; AudioPlayer::loadPcm(path, pcm); return pcm; },
+        txTxtPath(app.recordDir, file), [](int cid, const stt::Result& r) {
+            std::lock_guard<std::mutex> lk(g_txMtx);
+            auto f = g_txIdFile.find(cid);
+            if (f == g_txIdFile.end()) return;
+            TxEntry& e = g_tx[f->second];
+            e.state = !r.ok ? 4 : r.text.empty() ? 3 : 2;
+            e.lang = r.lang; e.text = r.text; e.en = r.text_en;
+        });
+}
+
+TxEntry txGet(const std::string& file) {
+    std::lock_guard<std::mutex> lk(g_txMtx);
+    auto it = g_tx.find(file);
+    return it == g_tx.end() ? TxEntry{} : it->second;
+}
+
+// New finished recordings: read an existing .txt, or queue the ones that ended
+// since InmarScope started (older ones get a Transcribe button).
+void txScan(App& app, const std::vector<VoiceCallRecord>& calls) {
+    auto& tx = stt::Transcriber::instance();
+    tx.set_enabled(app.sttOn);
+    tx.set_translate(app.sttTranslate);
+    tx.set_large_for_all(app.sttLargeAll);
+    for (const auto& c : calls) {
+        if (c.recording || c.filename.empty()) continue;
+        {
+            std::lock_guard<std::mutex> lk(g_txMtx);
+            if (g_tx.count(c.filename)) continue;
+            g_tx[c.filename];   // seen
+        }
+        TxEntry e;
+        if (txLoadTxt(txTxtPath(app.recordDir, c.filename), e)) {
+            std::lock_guard<std::mutex> lk(g_txMtx);
+            g_tx[c.filename] = e;
+        } else if (app.sttOn && tx.model_state(0) == stt::ModelState::Ready && c.durationSec >= 3.0 &&
+                   c.timeSec + c.durationSec >= g_txAppStart - 5) {
+            txQueue(app, c.filename);
+        }
+    }
+}
+
+void drawTxPanel(App& app, const std::string& file) {
+    auto& tx = stt::Transcriber::instance();
+    const TxEntry e = txGet(file);
+    if (e.state == 2) {
+        ImGui::TextDisabled("Transcript (%s)", e.lang.c_str());
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Copy##tx")) {
+            std::string s = e.text;
+            if (!e.en.empty()) s += "\n\nEnglish:\n" + e.en;
+            ImGui::SetClipboardText(s.c_str());
+        }
+        const float h = ImGui::GetTextLineHeightWithSpacing() * (e.en.empty() ? 4.5f : 7.5f);
+        ImGui::BeginChild("##txtext", ImVec2(0, h), true);
+        ImGui::TextWrapped("%s", e.text.c_str());
+        if (!e.en.empty()) { ImGui::Spacing(); ImGui::TextDisabled("English:"); ImGui::TextWrapped("%s", e.en.c_str()); }
+        ImGui::EndChild();
+    } else if (e.state == 1) {
+        ImGui::TextDisabled("Transcribing / queued (%d waiting)", tx.queued());
+    } else if (e.state == 3) {
+        ImGui::TextDisabled("Transcript: no speech found");
+    } else if (!app.sttOn || tx.model_state(0) != stt::ModelState::Ready) {
+        ImGui::TextDisabled("No transcript.");
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Set up transcription...")) app.showStt = true;
+    } else if (ImGui::SmallButton(e.state == 4 ? "Transcribe again" : "Transcribe")) {
+        txQueue(app, file);
+    }
+}
+
+void drawTranscriptionWindow(App& app) {
+    if (!app.showStt) return;
+    ImGui::SetNextWindowSize(ImVec2(560, 420), ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("Transcription###stt", &app.showStt)) {
+        auto& tx = stt::Transcriber::instance();
+        if (!stt::Transcriber::available()) {
+            ImGui::TextWrapped("This build doesn't include speech-to-text: whisper.cpp wasn't found when it was "
+                               "compiled. See the build notes for how to add it.");
+            ImGui::End();
+            return;
+        }
+        static bool vocabSet = false;
+        if (!vocabSet) { tx.set_vocabulary(app.sttVocab); vocabSet = true; }
+        ImGui::TextWrapped("Recorded voice calls are turned into text on this PC (whisper.cpp; nothing is sent "
+                           "anywhere), after each call ends and below normal priority. The text is shown in "
+                           "Voice Calls and saved next to the recording as a .txt.");
+        ImGui::Separator();
+        static const char* names[2] = {"Small model (every call, detects language)",
+                                       "Large-v3-turbo (re-does non-English calls, optional)"};
+        for (int m = 0; m < 2; m++) {
+            ImGui::PushID(m);
+            ImGui::TextUnformatted(names[m]);
+            const stt::ModelState st = tx.model_state(m);
+            if (st == stt::ModelState::Ready) {
+                ImGui::SameLine(); ImGui::TextColored(ImVec4(0.5f, 1, 0.5f, 1), "ready");
+            } else if (st == stt::ModelState::Downloading) {
+                char b[48]; std::snprintf(b, sizeof(b), "%.0f of %.0f MB", tx.download_progress(m) * tx.model_size_mb(m), tx.model_size_mb(m));
+                ImGui::ProgressBar(tx.download_progress(m), ImVec2(260, 0), b);
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Cancel")) tx.cancel_download(m);
+            } else {
+                char b[48]; std::snprintf(b, sizeof(b), "Download (%.0f MB)", tx.model_size_mb(m));
+                if (ImGui::Button(b)) tx.download(m);
+                if (st == stt::ModelState::Failed) { ImGui::SameLine(); ImGui::TextColored(ImVec4(1, .6f, .4f, 1), "download failed"); }
+            }
+            ImGui::PopID();
+        }
+        ImGui::Separator();
+        const bool ready = tx.model_state(0) == stt::ModelState::Ready;
+        if (!ready) ImGui::BeginDisabled();
+        ImGui::Checkbox("Transcribe recorded calls", &app.sttOn);
+        if (!ready) { ImGui::EndDisabled(); ImGui::SameLine(); ImGui::TextDisabled("(download the small model first)"); }
+        ImGui::Checkbox("Use the large model for all calls", &app.sttLargeAll);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("More accurate (names, accents, choppy audio) but about 3-4x slower and\n"
+                              "~1 GB more memory while working. Needs the large model; without it every\n"
+                              "call uses the small one. Off: large only re-does non-English calls.");
+        ImGui::Checkbox("Translate non-English calls to English", &app.sttTranslate);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Adds an English version under the original text. Uses the large model if\n"
+                              "downloaded. Treat translations as rough: on choppy audio Whisper can\n"
+                              "invent sentences when translating.");
+        ImGui::TextDisabled("Words to expect (names, jargon; English calls only):");
+        if (ImGui::InputTextMultiline("##vocab", app.sttVocab, sizeof(app.sttVocab), ImVec2(-1, ImGui::GetTextLineHeight() * 4)))
+            tx.set_vocabulary(app.sttVocab);
+        ImGui::Separator();
+        if (tx.busy_id() >= 0) ImGui::Text("Transcribing, %d waiting", tx.queued());
+        else ImGui::TextDisabled("Idle, %d waiting", tx.queued());
+        ImGui::TextDisabled("Models are stored in the models folder next to InmarScope.exe.");
+    }
+    ImGui::End();
+}
+} // namespace
+
 void drawVoiceCalls(App& app)
 {
     ImGui::Begin((std::string(_L("Voice Calls")) + "###Voice Calls").c_str());
@@ -2885,9 +3075,11 @@ void drawVoiceCalls(App& app)
             if (!loadedSel) app.audioPlayer.play(std::string(app.recordDir) + "/" + selFile);
             app.audioPlayer.seek(at);
         }
+        drawTxPanel(app, selFile);
     }
+    txScan(app, calls);
 
-    if (ImGui::BeginTable("##vclist", 5,
+    if (ImGui::BeginTable("##vclist", 6,
                           ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
                           ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable))
     {
@@ -2895,7 +3087,8 @@ void drawVoiceCalls(App& app)
         ImGui::TableSetupColumn("Freq", ImGuiTableColumnFlags_WidthFixed, 78);
         ImGui::TableSetupColumn("ICAO", ImGuiTableColumnFlags_WidthFixed, 64);
         ImGui::TableSetupColumn("Duration", ImGuiTableColumnFlags_WidthFixed, 72);
-        ImGui::TableSetupColumn(">");
+        ImGui::TableSetupColumn(">", ImGuiTableColumnFlags_WidthFixed, 24);
+        ImGui::TableSetupColumn("Transcript");
         ImGui::TableSetupScrollFreeze(0, 1);
         ImGui::TableHeadersRow();
 
@@ -2980,6 +3173,26 @@ void drawVoiceCalls(App& app)
                     selFile = c.filename;
                 }
             }
+            ImGui::TableNextColumn();
+            if (!c.filename.empty()) {
+                const TxEntry te = txGet(c.filename);
+                if (te.state == 1) ImGui::TextDisabled("queued");
+                else if (te.state == 3) ImGui::TextDisabled("(no speech)");
+                else if (te.state == 4) ImGui::TextDisabled("(failed)");
+                else if (te.state == 2) {
+                    ImGui::TextDisabled("[%s]", te.lang.c_str());
+                    ImGui::SameLine(0, 4);
+                    ImGui::TextUnformatted(te.text.c_str());
+                    if (ImGui::IsItemHovered()) {
+                        ImGui::BeginTooltip();
+                        ImGui::PushTextWrapPos(ImGui::GetFontSize() * 40.0f);
+                        ImGui::TextUnformatted(te.text.c_str());
+                        if (!te.en.empty()) { ImGui::Separator(); ImGui::TextDisabled("English:"); ImGui::TextUnformatted(te.en.c_str()); }
+                        ImGui::PopTextWrapPos();
+                        ImGui::EndTooltip();
+                    }
+                }
+            }
             copyRows.push_back(copyFmt("%02d:%02d:%02d\t%.4f\t%s\t%s",
                 tm.tm_hour, tm.tm_min, tm.tm_sec, c.freqMHz,
                 c.icao.empty() ? (c.aesId ? copyFmt("%06X", c.aesId).c_str() : "--") : c.icao.c_str(),
@@ -2992,6 +3205,7 @@ void drawVoiceCalls(App& app)
     }
 
     ImGui::End();
+    drawTranscriptionWindow(app);
 }
 
 // ---------------------------------------------------------------------------
@@ -3297,6 +3511,7 @@ void drawDockHost(App& app)
             if (ImGui::MenuItem("Reset pane layout to default", "Ctrl+Shift+R"))
                 forceLayout = true;
             ImGui::Separator();
+            ImGui::MenuItem("Transcription...", nullptr, &app.showStt);
             ImGui::MenuItem(_L("Drag a tab out to float a pane on the desktop"), nullptr, false, false);
             ImGui::MenuItem(_L("Right-click a table row (or Ctrl+C) to copy"), nullptr, false, false);
             ImGui::EndMenu();
